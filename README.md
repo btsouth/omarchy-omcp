@@ -31,7 +31,7 @@ until you approve it. One switch stops all of it.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/tsouth89/omarchy-omcp --enable
+omarchy plugin add https://github.com/btsouth/omarchy-omcp --enable
 ```
 
 That clones the plugin, enables it, and places the ghost on the bar. If the icon is missing after that, recover with `omarchy bar put tsouth89.omcp`.

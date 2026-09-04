@@ -6,7 +6,7 @@
   "author": "Tyler South",
   "license": "MIT",
   "description": "Turn this desktop into an MCP server so Claude Code and other agents can drive it — themes, windows, workspaces, notifications, screenshots — and watch every move land live in the bar.",
-  "homepage": "https://github.com/tsouth89/omarchy-omcp",
+  "homepage": "https://github.com/btsouth/omarchy-omcp",
   "kinds": ["bar-widget", "service"],
   "entryPoints": {
     "barWidget": "Panel.qml",
