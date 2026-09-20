@@ -14,6 +14,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -259,6 +260,137 @@ class ApprovalBinding(unittest.TestCase):
             approved_run()
         self.assertEqual(summary, "take a screenshot of monitor DP-1")
         capture.assert_called_once_with(["grim", "-t", "png", "-o", "DP-1"], "png", "DP-1")
+
+
+class CancelledCalls(unittest.TestCase):
+    """A client that gives up on a call must not leave a prompt or a held slot.
+
+    MCP lets a client withdraw a request it no longer wants an answer to
+    (notifications/cancelled). Without that, the parked approval card stayed on
+    screen and the single approval slot stayed held until the 60 second timeout,
+    blocking every other agent behind a request nobody was waiting for.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="omcp-cancel-test-")
+        self.old_paths = {
+            name: getattr(omcp, name) for name in (
+                "CONFIG_DIR", "STATE_DIR", "CONFIG_PATH", "ACTIVITY_PATH",
+                "AGENTS_PATH", "PENDING_PATH", "PENDING_LOCK", "DECISION_DIR",
+            )
+        }
+        omcp.CONFIG_DIR = os.path.join(self.tmp, "config")
+        omcp.STATE_DIR = os.path.join(self.tmp, "state")
+        omcp.CONFIG_PATH = os.path.join(omcp.CONFIG_DIR, "config.json")
+        omcp.ACTIVITY_PATH = os.path.join(omcp.STATE_DIR, "activity.jsonl")
+        omcp.AGENTS_PATH = os.path.join(omcp.STATE_DIR, "agents.json")
+        omcp.PENDING_PATH = os.path.join(omcp.STATE_DIR, "pending.json")
+        omcp.PENDING_LOCK = omcp.PENDING_PATH + ".lock"
+        omcp.DECISION_DIR = os.path.join(omcp.STATE_DIR, "decisions")
+
+    def tearDown(self):
+        for name, value in self.old_paths.items():
+            setattr(omcp, name, value)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _server():
+        server = omcp.Server()
+        server.touch = lambda: None
+        return server
+
+    def test_withdrawn_notification_clears_the_parked_request(self):
+        server = self._server()
+        server.handle({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                       "params": {"name": "lock_screen", "arguments": {}}})
+        request_id, name, arguments, cancel = server.work.get_nowait()
+        self.assertEqual((request_id, name, arguments), (7, "lock_screen", {}))
+
+        answer = {}
+        with mock.patch.object(omcp, "notify"), \
+                mock.patch.object(omcp, "dismiss_notification") as dismiss, \
+                mock.patch.object(omcp, "ASK_TIMEOUT_SECONDS", 30):
+            holder = threading.Thread(target=lambda: answer.update(dict(zip(
+                ("granted", "reason"),
+                omcp.request_approval("claude-code", name, "lock the screen", "{}", cancel)))))
+            holder.start()
+            deadline = time.time() + 5
+            while time.time() < deadline and not os.path.exists(omcp.PENDING_PATH):
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(omcp.PENDING_PATH), "the call should be parked while it waits")
+            server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                           "params": {"requestId": 7}})
+            holder.join(timeout=10)
+
+        self.assertFalse(holder.is_alive(), "a withdrawn call must stop waiting, not sit out the timeout")
+        self.assertFalse(answer["granted"])
+        self.assertIn("cancelled", answer["reason"])
+        self.assertFalse(os.path.exists(omcp.PENDING_PATH), "the prompt must come off the screen")
+        self.assertFalse(os.path.exists(omcp.PENDING_LOCK), "the approval slot must be released")
+        self.assertTrue(dismiss.called)
+
+    def test_an_already_withdrawn_call_is_refused_without_prompting(self):
+        cancel = threading.Event()
+        cancel.set()
+        logged = []
+        with mock.patch.object(omcp, "log_activity", logged.append), \
+                mock.patch.object(omcp, "request_approval") as approval:
+            with self.assertRaises(omcp.ToolError):
+                omcp.call_tool("lock_screen", {}, "claude-code", cancel)
+        approval.assert_not_called()
+        self.assertEqual(logged[0]["state"], "denied")
+        self.assertIn("cancelled", logged[0]["summary"])
+
+    def test_a_withdrawn_call_is_never_answered(self):
+        server = self._server()
+        sent = []
+        server.send = sent.append
+        cancel = threading.Event()
+        cancel.set()
+        server.work.put((99, "lock_screen", {}, cancel))
+        server.work.put(None)
+        with mock.patch.object(omcp, "call_tool", side_effect=omcp.ToolError("the agent cancelled this call")):
+            server.run_work()
+        self.assertEqual(sent, [], "MCP forbids a response for a cancelled request")
+
+    def test_a_live_call_is_still_answered(self):
+        server = self._server()
+        sent = []
+        server.send = sent.append
+        server.work.put((99, "get_system_stats", {}, threading.Event()))
+        server.work.put(None)
+        with mock.patch.object(omcp, "call_tool", return_value={"theme": "Tokyo Night"}):
+            server.run_work()
+        self.assertEqual([message["id"] for message in sent], [99])
+        self.assertIn("Tokyo Night", sent[0]["result"]["content"][0]["text"])
+
+    def test_inflight_table_drops_the_call_when_it_finishes(self):
+        server = self._server()
+        server.send = lambda message: None
+        server.handle({"jsonrpc": "2.0", "id": "abc", "method": "tools/call",
+                       "params": {"name": "get_system_stats", "arguments": {}}})
+        self.assertEqual(list(server.inflight), [("str", "abc")])
+        server.work.put(None)
+        with mock.patch.object(omcp, "call_tool", return_value={}):
+            server.run_work()
+        self.assertEqual(server.inflight, {})
+
+    def test_ids_of_different_types_do_not_collide(self):
+        self.assertNotEqual(omcp.Server.request_key(1), omcp.Server.request_key("1"))
+
+    def test_an_unhashable_request_id_is_ignored(self):
+        server = self._server()
+        server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": {"nested": True}}})
+        server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": ["a", "b"]}})
+        server.handle({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {}})
+        # A call carrying one must still be queued rather than taking the loop down.
+        server.handle({"jsonrpc": "2.0", "id": ["weird"], "method": "tools/call",
+                       "params": {"name": "get_system_stats", "arguments": {}}})
+        request_id, name, _, _ = server.work.get_nowait()
+        self.assertEqual((request_id, name), (["weird"], "get_system_stats"))
+        self.assertEqual(server.inflight, {})
 
 
 class ConfigProfiles(unittest.TestCase):

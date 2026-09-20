@@ -122,6 +122,10 @@ typing into — with Approve one keystroke away. For the same reason the `a`, `d
 inert until you have moved the cursor with an arrow key. Hover does not arm them. An agent must
 never be able to make the next key you press mean "yes" or throw the kill switch.
 
+If the agent gives up on the call first (you pressed escape in its client, or it stopped waiting), the
+prompt comes off the screen and the request is released straight away. Nothing is left for you to
+answer, and the next agent's request is not stuck behind it.
+
 ### The kill switch
 
 The big one at the top of the Activity tab, or middle-click the ghost. While it is on, nothing
