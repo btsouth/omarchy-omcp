@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 PROTOCOL_DEFAULT = "2025-06-18"
 SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 
@@ -481,7 +481,18 @@ def _lock_expiry():
         return None
 
 
-def _acquire_pending_slot(deadline, expires):
+def cancelled(cancel):
+    """Whether the client has withdrawn the call this thread is holding.
+
+    `cancel` is a threading.Event owned by the read loop, which sets it when a
+    notifications/cancelled arrives for the same request id. Everything that
+    waits on the user's answer checks it, so a withdrawn call stops prompting
+    instead of sitting out its full timeout.
+    """
+    return cancel is not None and cancel.is_set()
+
+
+def _acquire_pending_slot(deadline, expires, cancel=None):
     """Claim the single approval slot, or give up at `deadline`.
 
     The expiry is stamped into the lock file itself at creation rather than
@@ -492,6 +503,8 @@ def _acquire_pending_slot(deadline, expires):
     saw one prompt, and whichever agent lost silently waited out its timeout.
     """
     while True:
+        if cancelled(cancel):
+            return False
         try:
             fd = os.open(PENDING_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             try:
@@ -521,11 +534,24 @@ def _acquire_pending_slot(deadline, expires):
             return False
 
 
-def request_approval(agent_name, tool, summary, detail):
+def request_approval(agent_name, tool, summary, detail, cancel=None):
+    """Hold a call until the user answers, or the client stops waiting for it.
+
+    A withdrawn call (notifications/cancelled) ends the wait here: the prompt
+    comes off the screen and the single approval slot is released at once.
+    Otherwise a user who gave up in their agent still had a red card to answer,
+    and every other agent queued behind a request nobody was waiting for until
+    the 60 second timeout ran out.
+    """
     summary = safe_display_text(summary, limit=200)
+    # The slot lives in the state dir, which a fresh machine has not created
+    # yet; without this the claim fails as if another agent held it.
+    ensure_dirs()
     deadline = time.time() + ASK_TIMEOUT_SECONDS
     expires = int(deadline)
-    if not _acquire_pending_slot(deadline, expires):
+    if not _acquire_pending_slot(deadline, expires, cancel):
+        if cancelled(cancel):
+            return False, "the agent cancelled the request"
         return False, "another approval request is already waiting"
 
     request_id = secrets.token_urlsafe(12)
@@ -550,6 +576,8 @@ def request_approval(agent_name, tool, summary, detail):
     answer_path = decision_path(request_id)
     try:
         while time.time() < deadline:
+            if cancelled(cancel):
+                return False, "the agent cancelled the request"
             decision = read_json(answer_path, None)
             if decision is not None:
                 granted = decision.get("decision") == "allow"
@@ -1696,10 +1724,17 @@ def render_prompt(name, arguments):
 
 # ------------------------------------------------------------------- dispatch
 
-def call_tool(name, arguments, agent_name):
+def call_tool(name, arguments, agent_name, cancel=None):
     spec = TOOLS.get(name)
     if spec is None:
         raise ToolError("unknown tool %r" % name)
+
+    # Already withdrawn before it started (queued behind another parked call,
+    # say). Nothing to ask the user about, so do not ask.
+    if cancelled(cancel):
+        log_activity({"agent": agent_name, "tool": name, "state": "denied",
+                      "summary": "cancelled by the agent before it ran"})
+        raise ToolError("the agent cancelled this call")
 
     config = load_config()
 
@@ -1722,8 +1757,13 @@ def call_tool(name, arguments, agent_name):
         # Validate (and name the target) before parking the call. Approving
         # "close window" with no title is the thing Ask exists to prevent.
         summary, approved_run = prepare_approval(name, arguments, spec)
-        granted, reason = request_approval(agent_name, name, summary, json.dumps(arguments, ensure_ascii=False))
+        granted, reason = request_approval(agent_name, name, summary, json.dumps(arguments, ensure_ascii=False),
+                                           cancel)
         if not granted:
+            if cancelled(cancel):
+                log_activity({"agent": agent_name, "tool": name, "state": "denied",
+                              "summary": "cancelled by the agent before an answer"})
+                raise ToolError("the agent cancelled this call before it was answered")
             log_activity({"agent": agent_name, "tool": name, "state": "denied", "summary": reason})
             raise ToolError("The user did not approve this (%s)." % reason)
         config = load_config()
@@ -1950,6 +1990,10 @@ class Server:
         self.stop = threading.Event()
         self.write_lock = threading.Lock()
         self.work = queue.Queue()
+        # Calls a client can still withdraw, keyed by JSON-RPC id. The read loop
+        # sets the event; the worker holding that call notices and stops waiting.
+        self.inflight = {}
+        self.inflight_lock = threading.Lock()
         # Seeded at construction, not on the first heartbeat: a change that
         # landed before the first tick would otherwise become the baseline and
         # go unannounced.
@@ -2089,40 +2133,86 @@ class Server:
         if not isinstance(arguments, dict):
             self.fail(request_id, -32602, "arguments must be an object")
             return
+        cancel = threading.Event()
+        try:
+            with self.inflight_lock:
+                self.inflight[self.request_key(request_id)] = cancel
+        except TypeError:
+            pass                       # an id no cancellation could ever name
         # Hand off and keep reading. A tool gated on approval parks for up to a
         # minute; running it here would leave pings and everything queued behind
         # it unanswered until the user came back.
-        self.work.put((request_id, params.get("name"), arguments))
+        self.work.put((request_id, params.get("name"), arguments, cancel))
+
+    @staticmethod
+    def request_key(request_id):
+        """A hashable identity for a JSON-RPC id.
+
+        Ids may be strings or numbers and `1` is not `"1"`, so the type travels
+        with the value. Anything unhashable is not an id we were ever sent.
+        """
+        return (type(request_id).__name__, request_id)
+
+    def handle_cancelled(self, params):
+        """Stop a tool call the client no longer wants an answer to.
+
+        MCP sends this as a notification, so there is no reply to send. The
+        thread holding the call notices the flag, releases the approval slot and
+        withdraws the prompt; run_work then sends no response, which the protocol
+        forbids for a cancelled request.
+        """
+        if "requestId" not in params:
+            return
+        try:
+            key = self.request_key(params.get("requestId"))
+            with self.inflight_lock:
+                cancel = self.inflight.get(key)
+        except TypeError:
+            return                     # not an id this server would ever be sent
+        if cancel is not None:
+            cancel.set()
 
     def run_work(self):
         while True:
             item = self.work.get()
             if item is None:
                 return
-            request_id, name, arguments = item
-            self.calls += 1
-            self.touch()
+            request_id, name, arguments, cancel = item
             try:
-                answer = {"content": content_for(call_tool(name, arguments, self.agent_name))}
-            except ToolError as exc:
-                answer = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
-            except Exception as exc:                       # noqa: BLE001 - one call must not end the session
-                answer = {"content": [{"type": "text",
-                                       "text": "%s: %s" % (type(exc).__name__, exc)}], "isError": True}
-            try:
-                self.reply(request_id, answer)
-            except OSError:
-                # The client's pipe is gone. Returning here would leave the
-                # process alive and still heartbeating, accepting calls into a
-                # queue nothing drains — a server that looks connected and
-                # answers nothing. End the session instead, the way a failed
-                # write on the read loop already does.
-                self.stop.set()
+                self.calls += 1
+                self.touch()
                 try:
-                    os.kill(os.getpid(), signal.SIGTERM)
+                    answer = {"content": content_for(call_tool(name, arguments, self.agent_name, cancel))}
+                except ToolError as exc:
+                    answer = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
+                except Exception as exc:                       # noqa: BLE001 - one call must not end the session
+                    answer = {"content": [{"type": "text",
+                                           "text": "%s: %s" % (type(exc).__name__, exc)}], "isError": True}
+                # A withdrawn call is never answered. The client has stopped
+                # tracking that id, and MCP says not to respond to it. What was
+                # attempted is still in the activity log.
+                if cancel.is_set():
+                    continue
+                try:
+                    self.reply(request_id, answer)
                 except OSError:
+                    # The client's pipe is gone. Returning here would leave the
+                    # process alive and still heartbeating, accepting calls into a
+                    # queue nothing drains — a server that looks connected and
+                    # answers nothing. End the session instead, the way a failed
+                    # write on the read loop already does.
+                    self.stop.set()
+                    try:
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    except OSError:
+                        pass
+                    return
+            finally:
+                try:
+                    with self.inflight_lock:
+                        self.inflight.pop(self.request_key(request_id), None)
+                except TypeError:
                     pass
-                return
 
     def handle(self, message):
         method = message.get("method")
@@ -2130,6 +2220,13 @@ class Server:
         params = message.get("params")
         if not isinstance(params, dict):
             params = {}
+
+        # A client may withdraw a call it no longer wants, whether or not this
+        # server is still holding it. Handled before the notification guard
+        # below, which would otherwise drop it unread.
+        if method == "notifications/cancelled":
+            self.handle_cancelled(params)
+            return
 
         # No "id" means a notification, and JSON-RPC forbids answering one.
         # Replying "id": null was both a spec violation and indistinguishable
