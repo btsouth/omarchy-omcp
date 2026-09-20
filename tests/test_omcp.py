@@ -50,11 +50,13 @@ class Validators(unittest.TestCase):
         self.assertFalse(omcp.REQUEST_ID_RE.fullmatch("abc\n"))
 
     def test_resolve_bin_ignores_relative_and_path_sep(self):
-        self.assertIsNone(omcp.resolve_bin("../usr/bin/hyprctl"))
-        self.assertIsNone(omcp.resolve_bin("/usr/bin/hyprctl"))
+        self.assertIsNone(omcp.resolve_bin("../usr/bin/env"))
+        self.assertIsNone(omcp.resolve_bin("/usr/bin/env"))
         self.assertIsNone(omcp.resolve_bin(""))
-        found = omcp.resolve_bin("hyprctl")
-        self.assertEqual(found, "/usr/bin/hyprctl")
+        # A binary every host has, so the positive case does not depend on this
+        # machine's Omarchy install being present.
+        found = omcp.resolve_bin("env")
+        self.assertTrue(found and found.endswith("/env"))
 
     def test_clean_label_strips_controls(self):
         self.assertEqual(omcp.clean_label("x\n\ty", "agent"), "x y")
@@ -528,6 +530,31 @@ class ConfigProfiles(unittest.TestCase):
         self.assertEqual(os.stat(omcp.CONFIG_DIR).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(omcp.STATE_DIR).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(omcp.CONFIG_PATH).st_mode & 0o777, 0o600)
+
+
+class Manifest(unittest.TestCase):
+    """The pieces that have to agree with each other before a release goes out."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(ROOT, "manifest.json"), "r", encoding="utf-8") as fh:
+            cls.manifest = json.load(fh)
+        with open(os.path.join(ROOT, "Panel.qml"), "r", encoding="utf-8") as fh:
+            cls.panel = fh.read()
+
+    def test_server_and_manifest_versions_agree(self):
+        self.assertEqual(self.manifest["version"], omcp.VERSION)
+
+    def test_the_plugin_id_is_the_permanent_listed_one(self):
+        # The marketplace treats a plugin id as permanent. Renaming the GitHub
+        # account must not move it, and Panel.qml has to answer to the same id
+        # or the widget stops matching the manifest.
+        self.assertEqual(self.manifest["id"], "tsouth89.omcp")
+        self.assertIn('moduleName: "%s"' % self.manifest["id"], self.panel)
+
+    def test_entry_points_exist(self):
+        for kind, path in self.manifest["entryPoints"].items():
+            self.assertTrue(os.path.isfile(os.path.join(ROOT, path)), "%s: %s" % (kind, path))
 
 
 class ProtocolState(unittest.TestCase):
