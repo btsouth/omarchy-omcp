@@ -116,6 +116,9 @@ The agent's tool call blocks mid-flight. The ghost turns urgent and starts breat
 notification fires. You get 60 seconds; **no answer means denied**, because an unattended machine
 should never grant anything.
 
+Approval notifications respect Do Not Disturb. The pending request remains available in the
+OMCP panel. If sending a notification fails, the MCP server reports it on stderr.
+
 The panel deliberately does **not** open itself when an agent asks. It takes exclusive keyboard
 focus, so summoning it on the agent's schedule would pull the keyboard out of whatever you were
 typing into — with Approve one keystroke away. For the same reason the `a`, `d`, and `p` shortcuts stay

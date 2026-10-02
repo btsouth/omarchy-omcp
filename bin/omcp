@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 PROTOCOL_DEFAULT = "2025-06-18"
 SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 
@@ -571,7 +571,7 @@ def request_approval(agent_name, tool, summary, detail, cancel=None):
     # prompt sitting next to the live one.
     dismiss_notification(ASK_HEADLINE)
     notify(ASK_HEADLINE, "%s wants to %s" % (agent_name, summary),
-           urgency="critical", exec_on_click="omarchy-shell omcp open")
+           urgency="critical", exec_on_click=["omarchy-shell", "omcp", "open"])
 
     answer_path = decision_path(request_id)
     try:
@@ -712,15 +712,19 @@ def dismiss_notification(headline):
 
 def notify(title, body="", urgency="normal", exec_on_click=None):
     args = ["omarchy", "notification", "send", "--app-name", "OMCP", "-u", urgency]
-    if exec_on_click:
-        args += ["--exec", exec_on_click]
     args += [plain_notification_text(title)]
     if body:
         args += [plain_notification_text(body)]
+    # Omarchy consumes every word after --exec as the click command's argv.
+    if exec_on_click:
+        args += ["--exec"] + list(exec_on_click)
     try:
-        subprocess.run(argv_trusted(args), capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError, ToolError):
-        pass
+        proc = subprocess.run(argv_trusted(args), capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0:
+            print("OMCP notification failed: exit %d" % proc.returncode, file=sys.stderr)
+    except (OSError, subprocess.SubprocessError, ToolError) as error:
+        # Keep MCP stdout and private notification text out of diagnostics.
+        print("OMCP notification failed: %s" % type(error).__name__, file=sys.stderr)
 
 
 # ------------------------------------------------------------------ validators

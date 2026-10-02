@@ -213,6 +213,46 @@ class DesktopEntries(unittest.TestCase):
         self.assertFalse(os.path.exists(launched["argv"][2]))
 
 
+class Notifications(unittest.TestCase):
+    def test_click_command_follows_text_as_separate_arguments(self):
+        with mock.patch.object(omcp, "argv_trusted", side_effect=lambda args: args), \
+                mock.patch.object(omcp.subprocess, "run", return_value=mock.Mock(returncode=0)) as send:
+            omcp.notify("OMCP is waiting", "agent wants approval", urgency="critical",
+                        exec_on_click=["omarchy-shell", "omcp", "open"])
+        self.assertEqual(send.call_args.args[0], [
+            "omarchy", "notification", "send", "--app-name", "OMCP", "-u", "critical",
+            "OMCP is waiting", "agent wants approval", "--exec", "omarchy-shell", "omcp", "open",
+        ])
+
+    def test_connection_notification_has_no_click_command(self):
+        with mock.patch.object(omcp, "argv_trusted", side_effect=lambda args: args), \
+                mock.patch.object(omcp.subprocess, "run", return_value=mock.Mock(returncode=0)) as send:
+            omcp.notify("Agent connected")
+        self.assertEqual(send.call_args.args[0], [
+            "omarchy", "notification", "send", "--app-name", "OMCP", "-u", "normal", "Agent connected",
+        ])
+
+    def test_failed_sender_reports_to_stderr_without_exposing_body(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(omcp, "argv_trusted", side_effect=lambda args: args), \
+                mock.patch.object(omcp.subprocess, "run", return_value=mock.Mock(returncode=1)), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            omcp.notify("Approval", "private desktop text")
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("notification failed: exit 1", stderr.getvalue())
+        self.assertNotIn("private desktop text", stderr.getvalue())
+
+    def test_sender_exception_does_not_interrupt_approval_handling(self):
+        for error in (OSError("unavailable"), omcp.subprocess.TimeoutExpired("omarchy", 10),
+                      omcp.ToolError("omarchy is not installed")):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(omcp, "argv_trusted", side_effect=lambda args: args), \
+                    mock.patch.object(omcp.subprocess, "run", side_effect=error), \
+                    contextlib.redirect_stderr(io.StringIO()) as stderr:
+                omcp.notify("Approval")
+            self.assertIn("notification failed", stderr.getvalue())
+
+
 class ApprovalBinding(unittest.TestCase):
     def test_window_address_reuse_is_rejected_after_approval(self):
         address = "0x55c2f0d67580"
@@ -309,7 +349,7 @@ class CancelledCalls(unittest.TestCase):
         self.assertEqual((request_id, name, arguments), (7, "lock_screen", {}))
 
         answer = {}
-        with mock.patch.object(omcp, "notify"), \
+        with mock.patch.object(omcp, "notify") as notify, \
                 mock.patch.object(omcp, "dismiss_notification") as dismiss, \
                 mock.patch.object(omcp, "ASK_TIMEOUT_SECONDS", 30):
             holder = threading.Thread(target=lambda: answer.update(dict(zip(
@@ -330,6 +370,9 @@ class CancelledCalls(unittest.TestCase):
         self.assertFalse(os.path.exists(omcp.PENDING_PATH), "the prompt must come off the screen")
         self.assertFalse(os.path.exists(omcp.PENDING_LOCK), "the approval slot must be released")
         self.assertTrue(dismiss.called)
+        notify.assert_called_once_with(
+            omcp.ASK_HEADLINE, "claude-code wants to lock the screen", urgency="critical",
+            exec_on_click=["omarchy-shell", "omcp", "open"])
 
     def test_an_already_withdrawn_call_is_refused_without_prompting(self):
         cancel = threading.Event()
