@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 PROTOCOL_DEFAULT = "2025-06-18"
 SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 
