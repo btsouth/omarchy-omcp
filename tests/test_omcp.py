@@ -12,6 +12,8 @@ import json
 import os
 import re
 import shutil
+import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -623,6 +625,113 @@ class ProtocolState(unittest.TestCase):
         server.send = messages.append
         server.announce_tool_changes()
         self.assertEqual(messages, [])
+
+
+class SessionDiscovery(unittest.TestCase):
+    """An MCP client may start serve with no Hyprland, Wayland or bus variables."""
+
+    def setUp(self):
+        self.runtime = tempfile.mkdtemp(prefix="omcp-run-")
+        self.addCleanup(shutil.rmtree, self.runtime, True)
+        self.listeners = []
+        self.addCleanup(lambda: [s.close() for s in self.listeners])
+        bus = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        bus.bind(os.path.join(self.runtime, "bus"))
+        self.listeners.append(bus)
+
+    def instance(self, signature, pid, display, listening=True):
+        directory = os.path.join(self.runtime, "hypr", signature)
+        os.makedirs(directory)
+        with open(os.path.join(directory, "hyprland.lock"), "w") as fh:
+            fh.write("%d\n%s\n" % (pid, display))
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(os.path.join(directory, ".socket.sock"))
+        if listening:
+            sock.listen(1)
+            self.listeners.append(sock)
+        else:
+            sock.close()  # the file stays, as after a crash
+        if omcp.WAYLAND_DISPLAY_RE.fullmatch(display):
+            wayland = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            wayland.bind(os.path.join(self.runtime, display))
+            self.listeners.append(wayland)
+
+    def newer_process(self):
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child.pid
+
+    def adopt(self, **env):
+        with mock.patch.dict(os.environ, dict(env, XDG_RUNTIME_DIR=self.runtime), clear=True):
+            omcp.adopt_session()
+            return {k: os.environ.get(k) for k in
+                    ("HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS")}
+
+    def test_stripped_environment_finds_the_login_session(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        self.instance("nested_2", self.newer_process(), "wayland-2")
+        self.instance("crashed_0", 999999999, "wayland-0", listening=False)
+        found = self.adopt()
+        self.assertEqual(found["HYPRLAND_INSTANCE_SIGNATURE"], "login_1")
+        self.assertEqual(found["WAYLAND_DISPLAY"], "wayland-1")
+        self.assertEqual(found["DBUS_SESSION_BUS_ADDRESS"], "unix:path=" + os.path.join(self.runtime, "bus"))
+        self.assertEqual(omcp.SESSION_FILLED,
+                         ["HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS"])
+
+    def test_a_stale_directory_alone_is_not_a_session(self):
+        self.instance("crashed_0", os.getpid(), "wayland-0", listening=False)
+        self.assertIsNone(self.adopt()["HYPRLAND_INSTANCE_SIGNATURE"])
+
+    def test_values_the_client_passed_are_kept(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        found = self.adopt(HYPRLAND_INSTANCE_SIGNATURE="omabox-guard", WAYLAND_DISPLAY="omabox-guard",
+                           DBUS_SESSION_BUS_ADDRESS="unix:path=/elsewhere")
+        self.assertEqual(found, {"HYPRLAND_INSTANCE_SIGNATURE": "omabox-guard", "WAYLAND_DISPLAY": "omabox-guard",
+                                 "DBUS_SESSION_BUS_ADDRESS": "unix:path=/elsewhere"})
+        self.assertEqual(omcp.SESSION_FILLED, [])
+
+    def test_a_known_signature_supplies_its_display(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        self.assertEqual(self.adopt(HYPRLAND_INSTANCE_SIGNATURE="login_1")["WAYLAND_DISPLAY"], "wayland-1")
+
+    def test_a_supplied_display_picks_its_own_instance(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        self.instance("nested_2", self.newer_process(), "wayland-2")
+        self.assertEqual(self.adopt(WAYLAND_DISPLAY="wayland-2")["HYPRLAND_INSTANCE_SIGNATURE"], "nested_2")
+
+    def test_a_supplied_display_with_no_instance_is_not_paired(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        self.assertIsNone(self.adopt(WAYLAND_DISPLAY="wayland-9")["HYPRLAND_INSTANCE_SIGNATURE"])
+
+    def test_a_custom_socket_name_is_used_when_it_exists(self):
+        self.instance("login_1", os.getpid(), "session-1")
+        self.assertEqual(self.adopt()["WAYLAND_DISPLAY"], "session-1")
+
+    def test_a_display_without_its_socket_is_not_set(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        os.unlink(os.path.join(self.runtime, "wayland-1"))
+        found = self.adopt()
+        self.assertEqual(found["HYPRLAND_INSTANCE_SIGNATURE"], "login_1")
+        self.assertIsNone(found["WAYLAND_DISPLAY"])
+
+    def test_doctor_still_reports_missing_hyprland_when_the_bus_was_found(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.runtime}, clear=True), \
+                contextlib.redirect_stdout(out), mock.patch.object(omcp, "load_config", return_value={
+                    "tools": {}, "profile": "operate", "paused": False}), \
+                mock.patch.object(omcp, "run_json", side_effect=omcp.ToolError("no hyprland")):
+            omcp.adopt_session()
+            omcp.cmd_doctor([])
+        self.assertIn("found DBUS_SESSION_BUS_ADDRESS", out.getvalue())
+        self.assertIn("no running Hyprland found", out.getvalue())
+
+    def test_unsafe_names_in_the_runtime_dir_are_ignored(self):
+        self.instance("bad.name", os.getpid(), "wayland-1")
+        self.instance("login_1", os.getpid(), "../../etc")
+        found = self.adopt()
+        self.assertEqual(found["HYPRLAND_INSTANCE_SIGNATURE"], "login_1")
+        self.assertIsNone(found["WAYLAND_DISPLAY"])
 
 
 if __name__ == "__main__":
