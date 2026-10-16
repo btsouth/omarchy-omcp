@@ -172,6 +172,10 @@ the kill switch is on (Connect tab, or
 `~/.config/omarchy/plugins/tsouth89.omcp/bin/omcp doctor`). The `omcp` file is not put on
 `PATH` at install.
 
+MCP clients often start `serve` without the desktop session in its environment. OMCP then finds
+the running Hyprland session, its Wayland display and the session bus on its own, filling in only
+what is missing. `doctor` shows when it had to.
+
 ## Keyboard and IPC
 
 In the panel: `←/→` tabs, `↑/↓` rows, `Enter` activates, and `f`/`t`/`c` jump to
