@@ -633,7 +633,8 @@ def write_decision(request_id, decision):
 # filled in: anything the client did pass is taken as meant.
 
 SIGNATURE_RE = re.compile(r"[A-Za-z0-9_]{1,200}")
-WAYLAND_DISPLAY_RE = re.compile(r"wayland-[A-Za-z0-9_.-]{1,64}")
+# A socket name inside the runtime dir: no path separators, no leading dot.
+WAYLAND_DISPLAY_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 
 # What adopt_session() filled in, for doctor. None until it has run.
 SESSION_FILLED = None
@@ -661,6 +662,13 @@ def process_start(pid):
         return None
 
 
+def is_socket(path):
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
 def socket_answers(path):
     probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(1)
@@ -686,7 +694,7 @@ def read_instance(runtime, signature):
 
 
 def hyprland_instances(runtime):
-    """Signatures of the running Hyprland instances, oldest first.
+    """(signature, wayland display) of the running Hyprland instances, oldest first.
 
     A crashed or logged-out session leaves its directory behind, so an instance
     only counts while its process exists and its socket answers. When several
@@ -707,8 +715,8 @@ def hyprland_instances(runtime):
         started = process_start(instance[0])
         if started is None or not socket_answers(os.path.join(runtime, "hypr", name, ".socket.sock")):
             continue
-        live.append((started, name))
-    return [name for _, name in sorted(live)]
+        live.append((started, name, instance[1]))
+    return [(name, display) for _, name, display in sorted(live)]
 
 
 def adopt_session():
@@ -724,17 +732,23 @@ def adopt_session():
         SESSION_FILLED.append("XDG_RUNTIME_DIR")
     if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
         instances = hyprland_instances(runtime)
+        # A display the client did pass picks its own compositor. Pairing it
+        # with another instance would split hyprctl and the Wayland tools
+        # across two desktops, so no match means no signature.
+        wanted = env.get("WAYLAND_DISPLAY")
+        if wanted:
+            instances = [i for i in instances if i[1] == wanted]
         if instances:
-            env["HYPRLAND_INSTANCE_SIGNATURE"] = instances[0]
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = instances[0][0]
             SESSION_FILLED.append("HYPRLAND_INSTANCE_SIGNATURE")
     signature = env.get("HYPRLAND_INSTANCE_SIGNATURE", "")
     if not env.get("WAYLAND_DISPLAY") and SIGNATURE_RE.fullmatch(signature):
         instance = read_instance(runtime, signature)
-        if instance and instance[1]:
+        if instance and instance[1] and is_socket(os.path.join(runtime, instance[1])):
             env["WAYLAND_DISPLAY"] = instance[1]
             SESSION_FILLED.append("WAYLAND_DISPLAY")
     bus = os.path.join(runtime, "bus")
-    if not env.get("DBUS_SESSION_BUS_ADDRESS") and os.path.exists(bus) and stat.S_ISSOCK(os.stat(bus).st_mode):
+    if not env.get("DBUS_SESSION_BUS_ADDRESS") and is_socket(bus):
         env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + bus
         SESSION_FILLED.append("DBUS_SESSION_BUS_ADDRESS")
 
@@ -2693,7 +2707,7 @@ def cmd_doctor(argv):
         # Empty when run from a terminal. With a stripped environment, the way
         # an MCP client may start serve, it shows what omcp found on its own.
         print("  session     found %s (not in the environment)" % ", ".join(SESSION_FILLED))
-    elif not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
         print("  session     no running Hyprland found for this account")
     try:
         run_json(["hyprctl", "-j", "activeworkspace"])

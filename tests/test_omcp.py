@@ -651,6 +651,10 @@ class SessionDiscovery(unittest.TestCase):
             self.listeners.append(sock)
         else:
             sock.close()  # the file stays, as after a crash
+        if omcp.WAYLAND_DISPLAY_RE.fullmatch(display):
+            wayland = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            wayland.bind(os.path.join(self.runtime, display))
+            self.listeners.append(wayland)
 
     def newer_process(self):
         child = subprocess.Popen(["sleep", "30"])
@@ -690,6 +694,37 @@ class SessionDiscovery(unittest.TestCase):
     def test_a_known_signature_supplies_its_display(self):
         self.instance("login_1", os.getpid(), "wayland-1")
         self.assertEqual(self.adopt(HYPRLAND_INSTANCE_SIGNATURE="login_1")["WAYLAND_DISPLAY"], "wayland-1")
+
+    def test_a_supplied_display_picks_its_own_instance(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        self.instance("nested_2", self.newer_process(), "wayland-2")
+        self.assertEqual(self.adopt(WAYLAND_DISPLAY="wayland-2")["HYPRLAND_INSTANCE_SIGNATURE"], "nested_2")
+
+    def test_a_supplied_display_with_no_instance_is_not_paired(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        self.assertIsNone(self.adopt(WAYLAND_DISPLAY="wayland-9")["HYPRLAND_INSTANCE_SIGNATURE"])
+
+    def test_a_custom_socket_name_is_used_when_it_exists(self):
+        self.instance("login_1", os.getpid(), "session-1")
+        self.assertEqual(self.adopt()["WAYLAND_DISPLAY"], "session-1")
+
+    def test_a_display_without_its_socket_is_not_set(self):
+        self.instance("login_1", os.getpid(), "wayland-1")
+        os.unlink(os.path.join(self.runtime, "wayland-1"))
+        found = self.adopt()
+        self.assertEqual(found["HYPRLAND_INSTANCE_SIGNATURE"], "login_1")
+        self.assertIsNone(found["WAYLAND_DISPLAY"])
+
+    def test_doctor_still_reports_missing_hyprland_when_the_bus_was_found(self):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": self.runtime}, clear=True), \
+                contextlib.redirect_stdout(out), mock.patch.object(omcp, "load_config", return_value={
+                    "tools": {}, "profile": "operate", "paused": False}), \
+                mock.patch.object(omcp, "run_json", side_effect=omcp.ToolError("no hyprland")):
+            omcp.adopt_session()
+            omcp.cmd_doctor([])
+        self.assertIn("found DBUS_SESSION_BUS_ADDRESS", out.getvalue())
+        self.assertIn("no running Hyprland found", out.getvalue())
 
     def test_unsafe_names_in_the_runtime_dir_are_ignored(self):
         self.instance("bad.name", os.getpid(), "wayland-1")
